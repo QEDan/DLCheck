@@ -135,11 +135,19 @@ class DLCheckCallback(L.Callback):
         if batch_count == 0:
             return True
 
+        # Check NaN gradients
+        for name in self.epoch_reports['nan_grads']:
+            passed = False
+            self.health_summary['issue_counts']['nan_gradients'][name] = \
+                self.health_summary['issue_counts']['nan_gradients'].get(name, 0) + 1
+            logging.warning(f"Parameter {name} had NaN/Inf gradients. training is likely broken.")
+
         # Check zero gradients
         for name in self.epoch_reports['zero_grads']:
             passed = False
-            logging.warning(f"Parameter {name} had zero gradients during one or more batches. "
-                            "Check that layer is connected and learning.")
+            self.health_summary['issue_counts']['zero_gradients'][name] = \
+                self.health_summary['issue_counts']['zero_gradients'].get(name, 0) + 1
+            logging.warning(f"Parameter {name} had zero gradients during one or more batches.")
         
         # Check update ratios
         for name, running_ratio in self.epoch_reports['update_ratios'].items():
@@ -148,19 +156,20 @@ class DLCheckCallback(L.Callback):
 
             if log_mean_ratio < self.unstable_learning_threshold_min:
                 passed = False
-                logging.warning(f"Parameter {name} has a mean update ratio of 10^{log_mean_ratio:.2f}, "
-                                f"which is less than 10^{self.unstable_learning_threshold_min}. "
-                                f"Learning may be slow.")
+                self.health_summary['issue_counts']['slow_learning'][name] = \
+                    self.health_summary['issue_counts']['slow_learning'].get(name, 0) + 1
+                logging.warning(f"Parameter {name} has a mean update ratio of 10^{log_mean_ratio:.2f} (slow).")
             
             if log_mean_ratio > self.unstable_learning_threshold_max:
                 passed = False
-                logging.warning(f"Parameter {name} has a mean update ratio of 10^{log_mean_ratio:.2f}, "
-                                f"which is greater than 10^{self.unstable_learning_threshold_max}. "
-                                f"Learning may be unstable.")
+                self.health_summary['issue_counts']['unstable_learning'][name] = \
+                    self.health_summary['issue_counts']['unstable_learning'].get(name, 0) + 1
+                logging.warning(f"Parameter {name} has a mean update ratio of 10^{log_mean_ratio:.2f} (unstable).")
         
         # Reset for next epoch
         self.epoch_reports = {
             'zero_grads': set(),
+            'nan_grads': set(),
             'update_ratios': {},
             'batch_count': 0
         }
@@ -174,8 +183,9 @@ class DLCheckCallback(L.Callback):
                 dead_fraction = stats['dead_count'] / stats['total_count']
                 if dead_fraction > self.dead_neuron_threshold:
                     passed = False
-                    logging.warning(f"Layer {name} has {dead_fraction:.2%} dead neurons. "
-                                    f"Check for vanishing gradients or dead ReLUs.")
+                    self.health_summary['issue_counts']['dead_activations'][name] = \
+                        self.health_summary['issue_counts']['dead_activations'].get(name, 0) + 1
+                    logging.warning(f"Layer {name} has {dead_fraction:.2%} dead neurons.")
             
             # Reset for next epoch
             stats['dead_count'] = 0
@@ -189,18 +199,28 @@ class DLCheckCallback(L.Callback):
         # Registry to track health statistics during the epoch
         self.epoch_reports = {
             'zero_grads': set(),
+            'nan_grads': set(),
             'update_ratios': {},  # {param_name: RunningSum}
             'batch_count': 0
+        }
+        # Final summary report across all epochs
+        self.health_summary = {
+            'total_batches': 0,
+            'issue_counts': {
+                'zero_gradients': {},
+                'nan_gradients': {},
+                'slow_learning': {},
+                'unstable_learning': {},
+                'dead_activations': {}
+            }
         }
         self._register_hooks(model)
 
     def on_after_backward(self, trainer, pl_module):
-        """Check gradients immediately after backward pass and update running stats."""
+        """Check gradients and log metrics."""
         self.epoch_reports['batch_count'] += 1
+        self.health_summary['total_batches'] += 1
         
-        # Support for multiple optimizers: use the max LR as a heuristic or check all
-        # For now, we'll associate the first optimizer's LR with all params
-        # TODO: Map parameters to specific optimizers for perfect accuracy
         lrs = [pg['lr'] for opt in trainer.optimizers for pg in opt.param_groups]
         max_lr = max(lrs) if lrs else 0.0
 
@@ -208,7 +228,16 @@ class DLCheckCallback(L.Callback):
             if not param.requires_grad:
                 continue
             
-            if param.grad is None or (param.grad == 0).all():
+            if param.grad is None:
+                continue
+
+            # NaN/Inf Sentry
+            if not torch.isfinite(param.grad).all():
+                self.epoch_reports['nan_grads'].add(name)
+                logger.error(f"NaN/Inf gradient detected in {name} at batch {self.epoch_reports['batch_count']}")
+                continue
+
+            if (param.grad == 0).all():
                 self.epoch_reports['zero_grads'].add(name)
                 continue
 
@@ -220,6 +249,10 @@ class DLCheckCallback(L.Callback):
                 if name not in self.epoch_reports['update_ratios']:
                     self.epoch_reports['update_ratios'][name] = 0.0
                 self.epoch_reports['update_ratios'][name] += ratio
+                
+                # Log metrics for experiment trackers
+                self.log(f"dlcheck/update_ratio/{name}", torch.log10(torch.tensor(ratio + EPS)), on_step=True)
+                self.log(f"dlcheck/grad_norm/{name}", mean_abs_grad, on_step=True)
 
     def on_train_start(self, trainer, pl_module):
         """Callback at start of training"""
@@ -235,9 +268,28 @@ class DLCheckCallback(L.Callback):
         self.check_dead_activations()
 
     def on_train_end(self, trainer, pl_module):
-        """Cleanup hooks at the end of training."""
+        """Cleanup hooks and print final Health Report."""
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
+
+        print("\n" + "="*40)
+        print("DLCheck Training Health Report")
+        print("="*40)
+        print(f"Total Batches Processed: {self.health_summary['total_batches']}")
+        
+        has_issues = False
+        for issue_type, layers in self.health_summary['issue_counts'].items():
+            if layers:
+                has_issues = True
+                print(f"\n{issue_type.replace('_', ' ').title()}:")
+                for layer_name, epoch_count in layers.items():
+                    print(f"  - {layer_name}: flagged in {epoch_count} epoch(s)")
+        
+        if not has_issues:
+            print("\nNo major training issues detected. Your model is healthy! ⚡")
+        else:
+            print("\nReview the flagged layers above to improve training stability.")
+        print("="*40 + "\n")
 
 
