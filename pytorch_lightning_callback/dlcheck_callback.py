@@ -9,13 +9,11 @@
     Learning Programs](https://arxiv.org/abs/2112.04036).
     [DeepDiagnosis is on Github](https://github.com/DeepDiagnosis/ICSE2022).
 """
-import copy
 import logging
 
 import torch
 
 import lightning.pytorch as L
-from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names
 
 logger = logging.getLogger("lightning.pytorch.core")
 EPS = 1.0e-32
@@ -31,18 +29,42 @@ class DLCheckCallback(L.Callback):
         self.divergence_threshold_max = config.get('divergence_threshold_max', 1.0e4)
         self.unstable_learning_threshold_min = config.get('unstable_learning_threshold_min', -8.0)
         self.unstable_learning_threshold_max = config.get('unstable_learning_threshold_max', 1.0)
+        self.dead_neuron_threshold = config.get('dead_neuron_threshold', 0.9)  # 90% dead
+        self.layers_to_monitor = config.get('layers_to_monitor', None)  # List of layer names
+        
         self.prev_param_stats = None
-        self.neuron_output_history = None
-        self.lowest_loss_value = None
         self.loss_history = None
+        self.hooks = []
+        self.activation_stats = {}
 
-    @staticmethod
-    def get_parameter_outputs(model, input_tensor):
-        """Gets output tensors for each parameter."""
-        node_names = get_graph_node_names(model)[0]  # First element is the training node names list
-        model_with_outs = create_feature_extractor(model, node_names)
-        outs = model_with_outs(input_tensor)
-        return outs
+    def _register_hooks(self, model):
+        """Register forward hooks to monitor activations."""
+        self.hooks = []
+        self.activation_stats = {}
+
+        for name, module in model.named_modules():
+            # If layers_to_monitor is provided, only monitor those
+            if self.layers_to_monitor is not None:
+                if name not in self.layers_to_monitor:
+                    continue
+            else:
+                # Default: monitor modules with parameters (excluding container modules)
+                if len(list(module.parameters(recurse=False))) == 0:
+                    continue
+                if isinstance(module, (torch.nn.Sequential, torch.nn.ModuleList)):
+                    continue
+
+            self.activation_stats[name] = {'dead_count': 0, 'total_count': 0}
+
+            def hook_fn(m, inp, out, n=name):
+                if isinstance(out, torch.Tensor):
+                    # For ReLU, "dead" means output is 0
+                    # We track the fraction of elements that are zero
+                    is_zero = (out == 0).float()
+                    self.activation_stats[n]['dead_count'] += torch.sum(is_zero).item()
+                    self.activation_stats[n]['total_count'] += out.numel()
+
+            self.hooks.append(module.register_forward_hook(hook_fn))
 
     @staticmethod
     def _get_param_stats(model):
@@ -145,14 +167,24 @@ class DLCheckCallback(L.Callback):
         return passed
 
     def check_dead_activations(self):
+        """Report layers with a high percentage of dead neurons."""
         passed = True
-        param_outputs = self.get_parameter_outputs()
+        for name, stats in self.activation_stats.items():
+            if stats['total_count'] > 0:
+                dead_fraction = stats['dead_count'] / stats['total_count']
+                if dead_fraction > self.dead_neuron_threshold:
+                    passed = False
+                    logging.warning(f"Layer {name} has {dead_fraction:.2%} dead neurons. "
+                                    f"Check for vanishing gradients or dead ReLUs.")
+            
+            # Reset for next epoch
+            stats['dead_count'] = 0
+            stats['total_count'] = 0
+        return passed
 
     def init_callback(self, model: L.LightningModule) -> None:
         """Initialize the callback using the initial state of the model"""
         self.loss_history = []
-        self.lowest_loss_value = None
-        self.neuron_output_history = None
         self.prev_param_stats = self._get_param_stats(model)
         # Registry to track health statistics during the epoch
         self.epoch_reports = {
@@ -160,6 +192,7 @@ class DLCheckCallback(L.Callback):
             'update_ratios': {},  # {param_name: RunningSum}
             'batch_count': 0
         }
+        self._register_hooks(model)
 
     def on_after_backward(self, trainer, pl_module):
         """Check gradients immediately after backward pass and update running stats."""
@@ -199,6 +232,12 @@ class DLCheckCallback(L.Callback):
         self.check_untrained_params(pl_module)
         self.check_diverging_params(pl_module)
         self.check_unstable_learning(trainer, pl_module)
-        # self.check_dead_activations()  # TODO: implement with hooks
+        self.check_dead_activations()
+
+    def on_train_end(self, trainer, pl_module):
+        """Cleanup hooks at the end of training."""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
 
 

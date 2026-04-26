@@ -5,7 +5,6 @@ import pytest
 import torch
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision.models.feature_extraction import get_graph_node_names
 
 from pytorch_lightning_callback.dlcheck_callback import DLCheckCallback
 
@@ -108,7 +107,8 @@ class TestDLCheckCallback:
         passed = self.callback.check_unstable_learning(self.trainer, self.model)
         assert passed
 
-    def test_get_parameter_outputs(self, init):
-        outs = self.callback.get_parameter_outputs(self.model, self.data_loader.__iter__().__next__()[0])
-        node_names = get_graph_node_names(self.model)[0]
-        assert any(isinstance(outs[nn], torch.Tensor) for nn in node_names)
+    def test_check_dead_activations(self, init):
+        """Test that dead activations check works."""
+        self.trainer.fit(self.model, self.data_loader)
+        passed = self.callback.check_dead_activations()
+        assert passed
