@@ -60,24 +60,25 @@ class TestDLCheckCallback:
 
     def test_check_weight_initialization(self, init):
         """Check normal weight initialization"""
-        passed = self.callback.check_weight_initialization()
+        passed = self.callback.check_weight_initialization(self.model)
         assert passed
 
     def test_bad_weight_initialization(self):
         """Check weight initilization with zeroed weights"""
         for param in self.model.parameters():
             param.data = torch.zeros(param.shape)
-        self.callback.init_callback(self.model)
-        passed = self.callback.check_weight_initialization()
+        passed = self.callback.check_weight_initialization(self.model)
         assert not passed
 
     def test_check_untrained_params_fail(self, init):
         """Test that params are not updated with no training"""
+        # init_callback already set prev_param_stats
         passed = self.callback.check_untrained_params(self.model)
         assert not passed
 
     def test_check_untrained_params(self, init):
         """Test that params are updated with training"""
+        # init_callback already set prev_param_stats
         self.trainer.fit(self.model, self.data_loader)
         passed = self.callback.check_untrained_params(self.model)
         assert passed
