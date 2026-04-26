@@ -292,4 +292,28 @@ class DLCheckCallback(L.Callback):
             print("\nReview the flagged layers above to improve training stability.")
         print("="*40 + "\n")
 
+    def check_gradient_health(self, model: L.LightningModule):
+        """Check for exploding or vanishing gradients."""
+        raise NotImplementedError("Gradient health check (exploding/vanishing) is not yet implemented.")
+
+    def track_nan_propagation(self, model: L.LightningModule):
+        """Backtrack through the graph to find the source of NaN/Inf."""
+        raise NotImplementedError("NaN/Inf propagation tracking is not yet implemented.")
+
+    def check_loss_consistency(self, trainer: L.Trainer):
+        """Check if the loss is decreasing as expected."""
+        raise NotImplementedError("Loss inconsistency check is not yet implemented.")
+
+    def check_dying_relu(self, model: L.LightningModule):
+        """Detect layers with a high percentage of dying ReLUs."""
+        raise NotImplementedError("Dying ReLU detection is not yet implemented.")
+
+    def check_activation_saturation(self, model: L.LightningModule):
+        """Detect saturated Sigmoid or Tanh activations."""
+        raise NotImplementedError("Activation saturation check is not yet implemented.")
+
+    def check_untrained_layers_extended(self, model: L.LightningModule):
+        """Extended check for untrained layers using weight checksums."""
+        raise NotImplementedError("Extended untrained layer detection is not yet implemented.")
+
 
