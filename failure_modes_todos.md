@@ -50,3 +50,19 @@ This document tracks the implementation of complex diagnostic checks for deep le
 - [ ] **Weight Initialization Variance Check**
   - **Protocol:** Verify that the variance of initialized weights follows the expected scale for the layer type (e.g., Xavier/Kaiming).
   - **Reference:** [arXiv:1909.02562] (TFCheck, Section IV "Unbreaking Symmetry")
+
+## 5. Learning Dynamics & Silent Bugs
+*Goal: Detect high-level training pathologies from TheDeepChecker.*
+
+- [ ] **Loss Oscillation Detection**
+  - **Protocol:** Monitor the derivative of the smoothed loss curve. Flag if the sign of the derivative changes more than $K$ times within a small window.
+  - **Reference:** [TOSEM 2023] (TheDeepChecker, Section 4.2 "Dynamic Properties")
+- [ ] **Label Imbalance Sentry**
+  - **Protocol:** Aggregate the count of each class index during the first epoch. Flag if the ratio between class counts exceeds a threshold (e.g., >10x).
+  - **Reference:** [TOSEM 2023] (TheDeepChecker, Section 4.1 "Data Quality")
+- [ ] **Training-Validation Divergence (Overfitting)**
+  - **Protocol:** Monitor the gap between training and validation loss. Flag if validation loss increases while training loss continues to decrease.
+  - **Reference:** [TOSEM 2023] (TheDeepChecker, Section 4.3 "Model Performance")
+- [ ] **Data Loader / Augmentation Sanity Check**
+  - **Protocol:** Compare statistics (mean/std) of batches. Flag if augmentations produce values outside of expected input ranges.
+  - **Reference:** [TOSEM 2023] (TheDeepChecker, Section 4.1 "Preprocessing Defects")
