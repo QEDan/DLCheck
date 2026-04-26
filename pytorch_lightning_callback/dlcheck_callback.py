@@ -109,27 +109,38 @@ class DLCheckCallback(L.Callback):
     def check_unstable_learning(self, trainer, model):
         """Report issues found during the epoch and reset reports."""
         passed = True
-        
+        batch_count = self.epoch_reports['batch_count']
+        if batch_count == 0:
+            return True
+
+        # Check zero gradients
         for name in self.epoch_reports['zero_grads']:
             passed = False
             logging.warning(f"Parameter {name} had zero gradients during one or more batches. "
                             "Check that layer is connected and learning.")
         
-        for name in self.epoch_reports['slow_learning']:
-            passed = False
-            logging.warning(f"Parameter {name} had a slow update ratio. "
-                            "Learning may be slow. Consider increasing the learning rate.")
+        # Check update ratios
+        for name, running_ratio in self.epoch_reports['update_ratios'].items():
+            mean_ratio = running_ratio / batch_count
+            log_mean_ratio = torch.log10(torch.tensor(mean_ratio + EPS)).item()
+
+            if log_mean_ratio < self.unstable_learning_threshold_min:
+                passed = False
+                logging.warning(f"Parameter {name} has a mean update ratio of 10^{log_mean_ratio:.2f}, "
+                                f"which is less than 10^{self.unstable_learning_threshold_min}. "
+                                f"Learning may be slow.")
             
-        for name in self.epoch_reports['unstable_learning']:
-            passed = False
-            logging.warning(f"Parameter {name} had an unstable update ratio. "
-                            "Learning may be unstable. Consider lowering the learning rate.")
+            if log_mean_ratio > self.unstable_learning_threshold_max:
+                passed = False
+                logging.warning(f"Parameter {name} has a mean update ratio of 10^{log_mean_ratio:.2f}, "
+                                f"which is greater than 10^{self.unstable_learning_threshold_max}. "
+                                f"Learning may be unstable.")
         
         # Reset for next epoch
         self.epoch_reports = {
             'zero_grads': set(),
-            'slow_learning': set(),
-            'unstable_learning': set()
+            'update_ratios': {},
+            'batch_count': 0
         }
         return passed
 
@@ -143,16 +154,23 @@ class DLCheckCallback(L.Callback):
         self.lowest_loss_value = None
         self.neuron_output_history = None
         self.prev_param_stats = self._get_param_stats(model)
-        # Registry to track if any parameter has shown issues during the epoch
+        # Registry to track health statistics during the epoch
         self.epoch_reports = {
             'zero_grads': set(),
-            'slow_learning': set(),
-            'unstable_learning': set()
+            'update_ratios': {},  # {param_name: RunningSum}
+            'batch_count': 0
         }
 
     def on_after_backward(self, trainer, pl_module):
-        """Check gradients immediately after backward pass."""
-        lr = trainer.optimizers[0].param_groups[0]['lr']
+        """Check gradients immediately after backward pass and update running stats."""
+        self.epoch_reports['batch_count'] += 1
+        
+        # Support for multiple optimizers: use the max LR as a heuristic or check all
+        # For now, we'll associate the first optimizer's LR with all params
+        # TODO: Map parameters to specific optimizers for perfect accuracy
+        lrs = [pg['lr'] for opt in trainer.optimizers for pg in opt.param_groups]
+        max_lr = max(lrs) if lrs else 0.0
+
         for name, param in pl_module.named_parameters():
             if not param.requires_grad:
                 continue
@@ -161,14 +179,14 @@ class DLCheckCallback(L.Callback):
                 self.epoch_reports['zero_grads'].add(name)
                 continue
 
-            mean_abs_grad = torch.mean(torch.abs(param.grad))
-            mean_abs_val = torch.mean(torch.abs(param.data))
+            mean_abs_grad = torch.mean(torch.abs(param.grad)).item()
+            mean_abs_val = torch.mean(torch.abs(param.data)).item()
+            
             if mean_abs_val > 0:
-                update_ratio = torch.log10(lr * mean_abs_grad / mean_abs_val + EPS)
-                if update_ratio < self.unstable_learning_threshold_min:
-                    self.epoch_reports['slow_learning'].add(name)
-                if update_ratio > self.unstable_learning_threshold_max:
-                    self.epoch_reports['unstable_learning'].add(name)
+                ratio = (max_lr * mean_abs_grad) / (mean_abs_val + EPS)
+                if name not in self.epoch_reports['update_ratios']:
+                    self.epoch_reports['update_ratios'][name] = 0.0
+                self.epoch_reports['update_ratios'][name] += ratio
 
     def on_train_start(self, trainer, pl_module):
         """Callback at start of training"""
