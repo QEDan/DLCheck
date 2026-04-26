@@ -45,10 +45,18 @@ class DLCheckCallback(L.Callback):
         self.saturation_threshold_low = config.get('saturation_threshold_low', 0.05)
         self.loss_window_size = config.get('loss_window_size', 10)
 
+        # Data integrity thresholds [arXiv:1909.02562, arXiv:2412.11304]
+        self.input_mean_threshold = config.get('input_mean_threshold', 10.0)
+        self.input_std_threshold = config.get('input_std_threshold', 100.0)
+        self.leakage_batch_threshold = config.get('leakage_batch_threshold', 5)
+        self.leakage_loss_threshold = config.get('leakage_loss_threshold', 0.7)
+
         self.prev_param_stats = None
         self.loss_history = []
         self.hooks = []
         self.activation_stats = {}
+        self.input_stats = {}
+        self.sample_losses = {} # {sample_idx: [losses]}
         self.nan_source = None
         self.initial_weights = {}
 
@@ -56,11 +64,12 @@ class DLCheckCallback(L.Callback):
         """Register forward hooks to monitor activations.
         
         References:
-        - [arXiv:1909.02562] (Dying ReLU)
+        - [arXiv:1909.02562] (Dying ReLU, Input Scaling)
         - [arXiv:2112.04036] (Activation Saturation, NaN Propagation)
         """
         self.hooks = []
         self.activation_stats = {}
+        self.input_stats = {}
 
         for name, module in model.named_modules():
             # Skip the top-level model container itself if it's the only one
@@ -83,8 +92,20 @@ class DLCheckCallback(L.Callback):
                 'abs_count': 0,
                 'type': type(module).__name__
             }
+            self.input_stats[name] = {
+                'mean_sum': 0.0,
+                'std_sum': 0.0,
+                'count': 0
+            }
 
             def hook_fn(m, inp, out, n=name):
+                # Input Scaling Check [arXiv:1909.02562]
+                if isinstance(inp, (tuple, list)) and len(inp) > 0 and isinstance(inp[0], torch.Tensor):
+                    curr_inp = inp[0]
+                    self.input_stats[n]['mean_sum'] += torch.mean(curr_inp).item()
+                    self.input_stats[n]['std_sum'] += torch.std(curr_inp).item()
+                    self.input_stats[n]['count'] += 1
+
                 if isinstance(out, torch.Tensor):
                     # NaN/Inf Propagation Tracking [arXiv:2112.04036]
                     if self.nan_source is None and not torch.isfinite(out).all():
@@ -282,7 +303,7 @@ class DLCheckCallback(L.Callback):
         self._register_hooks(model)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        """Capture loss for consistency checks [arXiv:2411.08172]."""
+        """Capture loss for consistency and integrity checks."""
         loss = None
         if isinstance(outputs, dict) and 'loss' in outputs:
             loss = outputs['loss']
@@ -293,6 +314,35 @@ class DLCheckCallback(L.Callback):
             self.loss_history.append(loss.item())
             if len(self.loss_history) > 100:
                 self.loss_history.pop(0)
+
+        # Per-sample loss tracking for label noise detection
+        # We try to re-run the model on the batch with reduction='none'
+        if hasattr(pl_module, 'forward'):
+            try:
+                # Ensure model is in eval mode for re-run to avoid updating stats
+                was_training = pl_module.training
+                pl_module.eval()
+                
+                x, y = batch
+                # Move to same device
+                x = x.to(pl_module.device)
+                y = y.to(pl_module.device)
+                with torch.no_grad():
+                    out = pl_module(x)
+                    # Generic cross_entropy for classification, can be extended
+                    if out.shape[-1] > 1 and y.dtype == torch.long:
+                        per_sample_loss = torch.nn.functional.cross_entropy(out, y, reduction='none')
+                        batch_size = x.size(0)
+                        for i in range(batch_size):
+                            idx = batch_idx * batch_size + i
+                            if idx not in self.sample_losses:
+                                self.sample_losses[idx] = []
+                            self.sample_losses[idx].append(per_sample_loss[i].item())
+                
+                if was_training:
+                    pl_module.train()
+            except Exception:
+                pass # Skip if batch format is not standard (x, y)
 
     def on_after_backward(self, trainer, pl_module):
         """Check gradients and log metrics.
@@ -511,20 +561,54 @@ class DLCheckCallback(L.Callback):
         
         Reference: [arXiv:1909.02562] (TFCheck, Section III "Numerical Issues")
         """
-        raise NotImplementedError("Input scaling check is not yet implemented.")
+        passed = True
+        for name, stats in self.input_stats.items():
+            if stats['count'] > 0:
+                mean = stats['mean_sum'] / stats['count']
+                std = stats['std_sum'] / stats['count']
+                if abs(mean) > self.input_mean_threshold or std > self.input_std_threshold:
+                    passed = False
+                    logger.warning(f"Input scaling issue in layer {name}: mean={mean:.2f}, std={std:.2f}")
+        return passed
 
     def check_label_leakage(self, trainer: L.Trainer) -> bool:
         """Monitor for 'too good to be true' convergence.
         
         Reference: [arXiv:2412.11304] (An Empirical Study of Fault Localisation, Section 3.2 "Label Leakage")
         """
-        raise NotImplementedError("Label leakage detection is not yet implemented.")
+        if len(self.loss_history) < self.leakage_batch_threshold:
+            return True
+        
+        # Check if loss drops below threshold extremely quickly
+        for i, loss in enumerate(self.loss_history[:self.leakage_batch_threshold]):
+            if loss < self.leakage_loss_threshold:
+                logger.warning(f"Suspiciously fast convergence at batch {i+1} (loss={loss:.2e}). Possible label leakage.")
+                return False
+        return True
 
     def check_label_noise(self, trainer: L.Trainer) -> bool:
         """Track the loss per-sample across epochs to detect mislabeled data.
         
         Reference: [ACM 3637528.3671933] (BTTackler/DeepDiagnoser, Section 3.1 "Quality Indicators")
         """
-        raise NotImplementedError("Label noise detection is not yet implemented.")
+        if not self.sample_losses:
+            return True
+        
+        # Identify outliers: samples with consistently higher loss than others
+        avg_losses = {idx: sum(losses)/len(losses) for idx, losses in self.sample_losses.items()}
+        all_avg_losses = list(avg_losses.values())
+        if not all_avg_losses:
+            return True
+            
+        overall_mean = sum(all_avg_losses) / len(all_avg_losses)
+        
+        passed = True
+        for idx, avg_loss in avg_losses.items():
+            # If a sample's loss is significantly higher than the mean
+            if avg_loss > 1.1 * overall_mean and avg_loss > 0.0001:
+                passed = False
+                logger.warning(f"Potential mislabeled sample detected at index {idx} (avg loss={avg_loss:.4f}, mean={overall_mean:.4f})")
+        
+        return passed
 
 

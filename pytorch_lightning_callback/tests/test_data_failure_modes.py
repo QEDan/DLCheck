@@ -93,7 +93,15 @@ class TestDataFailureModes:
         model = DataIntegrityModel()
         
         # Train for a few epochs to see sample loss consistency
-        self.trainer.fit(model, loader)
+        trainer = L.Trainer(
+            accelerator="auto",
+            devices=1,
+            max_epochs=10,
+            callbacks=[self.callback],
+            logger=False,
+            enable_checkpointing=False
+        )
+        trainer.fit(model, loader)
         
-        passed = self.callback.check_label_noise(self.trainer)
+        passed = self.callback.check_label_noise(trainer)
         assert not passed
