@@ -49,12 +49,15 @@ class DLCheckCallback(L.Callback):
         # Data integrity thresholds [arXiv:1909.02562, arXiv:2412.11304]
         self.input_mean_threshold = config.get('input_mean_threshold', 10.0)
         self.input_std_threshold = config.get('input_std_threshold', 100.0)
-        self.leakage_batch_threshold = config.get('leakage_batch_threshold', 5)
-        self.leakage_loss_threshold = config.get('leakage_loss_threshold', 0.7)
+        self.leakage_batch_threshold = config.get('leakage_batch_threshold', 10)
+        self.leakage_loss_threshold = config.get('leakage_loss_threshold', 0.8)
 
         # Hardware thresholds [Nvidia Blog, PyTorch Doc]
         self.fragmentation_threshold = config.get('fragmentation_threshold', 0.7)
         self.bottleneck_threshold = config.get('bottleneck_threshold', 0.5) # 50% time in data loading
+
+        # Augmentation thresholds [TOSEM 2023]
+        self.augmentation_std_min_threshold = config.get('augmentation_std_min_threshold', 1e-6)
 
         self.prev_param_stats = None
         self.loss_history = []
@@ -625,6 +628,29 @@ class DLCheckCallback(L.Callback):
                                f"Consider increasing num_workers in DataLoader.")
                 return False
         return True
+
+    def check_augmentation_sanity(self, trainer: L.Trainer) -> bool:
+        """Compare statistics of batches to flag preprocessing defects.
+        
+        Reference: [TOSEM 2023] (TheDeepChecker, Section 4.1 "Preprocessing Defects")
+        """
+        passed = True
+        for name, stats in self.input_stats.items():
+            if stats['count'] > 0:
+                mean = stats['mean_sum'] / stats['count']
+                std = stats['std_sum'] / stats['count']
+                
+                # Check for out of range [TOSEM 2023]
+                if abs(mean) > self.input_mean_threshold or std > self.input_std_threshold:
+                    passed = False
+                    logger.warning(f"Augmentation/Preprocessing produces values out of range in {name}: mean={mean:.2f}, std={std:.2f}")
+                
+                # Check for constant/dead output [TOSEM 2023]
+                if std < self.augmentation_std_min_threshold:
+                    passed = False
+                    logger.warning(f"Augmentation/Preprocessing produces constant output in {name} (std={std:.2e}).")
+                    
+        return passed
 
     def check_input_scaling(self, model: L.LightningModule) -> bool:
         """Monitor the mean and variance of the input batch.
