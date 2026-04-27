@@ -10,6 +10,7 @@
     [DeepDiagnosis is on Github](https://github.com/DeepDiagnosis/ICSE2022).
 """
 import logging
+import time
 
 import torch
 
@@ -51,6 +52,10 @@ class DLCheckCallback(L.Callback):
         self.leakage_batch_threshold = config.get('leakage_batch_threshold', 5)
         self.leakage_loss_threshold = config.get('leakage_loss_threshold', 0.7)
 
+        # Hardware thresholds [Nvidia Blog, PyTorch Doc]
+        self.fragmentation_threshold = config.get('fragmentation_threshold', 0.7)
+        self.bottleneck_threshold = config.get('bottleneck_threshold', 0.5) # 50% time in data loading
+
         self.prev_param_stats = None
         self.loss_history = []
         self.hooks = []
@@ -59,6 +64,11 @@ class DLCheckCallback(L.Callback):
         self.sample_losses = {} # {sample_idx: [losses]}
         self.nan_source = None
         self.initial_weights = {}
+        
+        # Hardware state
+        self.last_batch_end_time = None
+        self.data_loading_times = []
+        self.batch_processing_times = []
 
     def _register_hooks(self, model):
         """Register forward hooks to monitor activations.
@@ -302,8 +312,20 @@ class DLCheckCallback(L.Callback):
         self.nan_source = None
         self._register_hooks(model)
 
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        """Track data loading time."""
+        now = time.time()
+        if self.last_batch_end_time is not None:
+            self.data_loading_times.append(now - self.last_batch_end_time)
+        self.batch_start_time = now
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         """Capture loss for consistency and integrity checks."""
+        now = time.time()
+        if hasattr(self, 'batch_start_time'):
+            self.batch_processing_times.append(now - self.batch_start_time)
+        self.last_batch_end_time = now
+
         loss = None
         if isinstance(outputs, dict) and 'loss' in outputs:
             loss = outputs['loss']
@@ -418,6 +440,10 @@ class DLCheckCallback(L.Callback):
             self.activation_stats[name]['abs_count'] = 0
         
         self.nan_source = None
+        
+        self.last_batch_end_time = time.time()
+        self.data_loading_times = []
+        self.batch_processing_times = []
 
     def on_train_epoch_end(self, trainer, pl_module):
         """Callback at end of training epoch"""
@@ -561,14 +587,44 @@ class DLCheckCallback(L.Callback):
         
         Reference: [Nvidia Blog] (Monitoring CUDA Memory)
         """
-        raise NotImplementedError("GPU memory fragmentation monitor is not yet implemented.")
+        if not torch.cuda.is_available():
+            return True
+            
+        # Get memory stats for the current device
+        device = trainer.strategy.root_device
+        if device.type != 'cuda':
+            return True
+            
+        stats = torch.cuda.memory_stats(device)
+        reserved = stats.get("reserved_bytes.all.current", 0)
+        allocated = stats.get("allocated_bytes.all.current", 0)
+        
+        if reserved > 0:
+            fragmentation = (reserved - allocated) / reserved
+            if fragmentation > self.fragmentation_threshold:
+                logger.warning(f"High GPU memory fragmentation detected: {fragmentation:.2%}. "
+                               f"Reserved: {reserved/1e9:.2f}GB, Allocated: {allocated/1e9:.2f}GB")
+                return False
+        return True
 
     def check_cpu_gpu_bottleneck(self, trainer: L.Trainer) -> bool:
         """Measure time delta between batches to detect data loading bottlenecks.
         
         Reference: [PyTorch Documentation] (Performance Tuning Guide)
         """
-        raise NotImplementedError("CPU-GPU bottleneck detector is not yet implemented.")
+        if not self.data_loading_times or not self.batch_processing_times:
+            return True
+            
+        total_data_time = sum(self.data_loading_times)
+        total_proc_time = sum(self.batch_processing_times)
+        
+        if (total_data_time + total_proc_time) > 0:
+            bottleneck_ratio = total_data_time / (total_data_time + total_proc_time)
+            if bottleneck_ratio > self.bottleneck_threshold:
+                logger.warning(f"CPU-GPU bottleneck detected: {bottleneck_ratio:.2%} of time spent loading data. "
+                               f"Consider increasing num_workers in DataLoader.")
+                return False
+        return True
 
     def check_input_scaling(self, model: L.LightningModule) -> bool:
         """Monitor the mean and variance of the input batch.
