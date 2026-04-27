@@ -59,6 +59,10 @@ class DLCheckCallback(L.Callback):
         # Augmentation thresholds [TOSEM 2023]
         self.augmentation_std_min_threshold = config.get('augmentation_std_min_threshold', 1e-6)
 
+        # LR monitoring thresholds
+        self.min_lr_threshold = config.get('min_lr_threshold', 1e-8)
+        self.max_loss_threshold = config.get('max_loss_threshold', 0.1)
+
         self.prev_param_stats = None
         self.loss_history = []
         self.hooks = []
@@ -627,6 +631,31 @@ class DLCheckCallback(L.Callback):
                 logger.warning(f"CPU-GPU bottleneck detected: {bottleneck_ratio:.2%} of time spent loading data. "
                                f"Consider increasing num_workers in DataLoader.")
                 return False
+        return True
+
+    def check_lr_health(self, trainer: L.Trainer) -> bool:
+        """Check if learning rate has vanished while loss is still high.
+        
+        Reference: [refactoring_todos.md Phase 5]
+        """
+        if not self.loss_history:
+            return True
+            
+        # Get current LRs from all optimizers
+        lrs = [pg['lr'] for opt in trainer.optimizers for pg in opt.param_groups]
+        if not lrs:
+            return True
+            
+        max_lr = max(lrs)
+        
+        # Calculate mean loss of the current window
+        mean_loss = sum(self.loss_history) / len(self.loss_history)
+        
+        if max_lr < self.min_lr_threshold and mean_loss > self.max_loss_threshold:
+            logger.warning(f"Vanishing learning rate detected: max LR is {max_lr:.2e} "
+                           f"while mean loss is {mean_loss:.4f}. Check LR scheduler.")
+            return False
+            
         return True
 
     def check_augmentation_sanity(self, trainer: L.Trainer) -> bool:
