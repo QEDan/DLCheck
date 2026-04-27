@@ -556,6 +556,20 @@ class DLCheckCallback(L.Callback):
                     logger.warning(f"Layer {name} was never updated during training.")
         return passed
 
+    def check_gpu_memory_fragmentation(self, trainer: L.Trainer) -> bool:
+        """Track torch.cuda.memory_stats() to detect potential OOMs before they happen.
+        
+        Reference: [Nvidia Blog] (Monitoring CUDA Memory)
+        """
+        raise NotImplementedError("GPU memory fragmentation monitor is not yet implemented.")
+
+    def check_cpu_gpu_bottleneck(self, trainer: L.Trainer) -> bool:
+        """Measure time delta between batches to detect data loading bottlenecks.
+        
+        Reference: [PyTorch Documentation] (Performance Tuning Guide)
+        """
+        raise NotImplementedError("CPU-GPU bottleneck detector is not yet implemented.")
+
     def check_input_scaling(self, model: L.LightningModule) -> bool:
         """Monitor the mean and variance of the input batch.
         
